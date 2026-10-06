@@ -5,7 +5,7 @@ services:
   engine:
     build: 
       context: .
-      dockerfile: Dockerfile.builder
+      dockerfile: Dockerfile
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     ports:

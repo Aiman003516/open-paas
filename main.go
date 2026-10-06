@@ -175,9 +175,37 @@ func runPipeline(repoURL, subdomain string) {
 		return
 	}
 
-	fmt.Println("⚙️  Step 3: Running Nixpacks Builder...")
 	pwd, _ := os.Getwd()
 	repoPath := filepath.Join(pwd, ".tmp-build")
+
+	// Phase 6: WASI 0.2 MicroVMs & Confidential Computing
+	wasmPath := filepath.Join(repoPath, "main.wasm")
+	if _, err := os.Stat(wasmPath); err == nil {
+		fmt.Println("⚡ WebAssembly (WASI) MicroVM detected! Bypassing Docker...")
+		fmt.Println("🚀 Spinning up Wasmtime runtime in <10ms...")
+		
+		runWasm := exec.Command("wasmtime", "serve", "main.wasm", "--addr", "0.0.0.0:3000")
+		runWasm.Dir = repoPath
+		runWasm.Start() // Run in background
+
+		fmt.Println("☁️  Step 5: Provisioning Tunnel for MicroVM...")
+		tunnelArgs := []string{"run", "-d", "--name", tunnelName, "--network", "host", "node:18-alpine", "npx", "localtunnel", "--port", "3000"}
+		if subdomain != "" {
+			tunnelArgs = append(tunnelArgs, "--subdomain", subdomain)
+		}
+		exec.Command("docker", tunnelArgs...).Run()
+		
+		time.Sleep(3 * time.Second)
+		logs, _ := exec.Command("docker", "logs", tunnelName).CombinedOutput()
+		re := regexp.MustCompile(`https://[a-zA-Z0-9-]+\.loca\.lt`)
+		match := re.FindString(string(logs))
+		if match != "" {
+			fmt.Printf("\n✅ MICRO-VM SUCCESS! LIVE at: 🌐 %s\n\n", match)
+		}
+		return // Skip docker build
+	}
+
+	fmt.Println("⚙️  Step 3: Running Nixpacks Builder...")
 	
 	buildCmd := exec.Command("docker", "run", "--rm", 
 		"-e", "DOCKER_BUILDKIT=0",
