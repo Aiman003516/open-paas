@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -39,13 +41,26 @@ func enableCORS(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+var (
+	clients   = make(map[chan string]bool)
+	broadcast = make(chan string)
+	mutex     = &sync.Mutex{}
+)
+
 func main() {
+	// Start the relay broker
+	go handleMessages()
+
 	// Register API Routes
 	http.HandleFunc("/webhook", enableCORS(webhookHandler))
 	http.HandleFunc("/deploy", enableCORS(webhookHandler)) // Same as webhook for now
 	http.HandleFunc("/deployments", enableCORS(getDeploymentsHandler))
 	http.HandleFunc("/logs", enableCORS(getLogsHandler))
 	http.HandleFunc("/restart", enableCORS(restartHandler))
+	
+	// Phase 7: Stateful Relay
+	http.HandleFunc("/relay", enableCORS(relayHandler))
+	http.HandleFunc("/publish", enableCORS(publishHandler))
 
 	fmt.Println("🚀 Open-PaaS Engine started on port 8080")
 	fmt.Println("API Endpoints Ready:")
@@ -54,6 +69,8 @@ func main() {
 	fmt.Println(" - GET  /deployments (List running apps)")
 	fmt.Println(" - GET  /logs?container=my-app (Stream logs)")
 	fmt.Println(" - POST /restart?container=my-app (Restart container)")
+	fmt.Println(" - GET  /relay   (Subscribe to events)")
+	fmt.Println(" - POST /publish (Send event)")
 	
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
@@ -263,4 +280,61 @@ func runPipeline(repoURL, subdomain string) {
 	} else {
 		fmt.Println("⚠️  Could not parse Tunnel URL yet. Check logs.")
 	}
+}
+
+// --- Phase 7: Stateful SSE Relay Handlers ---
+func handleMessages() {
+	for {
+		msg := <-broadcast
+		mutex.Lock()
+		for client := range clients {
+			client <- msg
+		}
+		mutex.Unlock()
+	}
+}
+
+func relayHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	messageChan := make(chan string)
+	mutex.Lock()
+	clients[messageChan] = true
+	mutex.Unlock()
+
+	defer func() {
+		mutex.Lock()
+		delete(clients, messageChan)
+		mutex.Unlock()
+		close(messageChan)
+	}()
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	for {
+		select {
+		case msg := <-messageChan:
+			fmt.Fprintf(w, "data: %s\n\n", msg)
+			flusher.Flush()
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+func publishHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	body, _ := io.ReadAll(r.Body)
+	broadcast <- string(body)
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Published"))
 }
