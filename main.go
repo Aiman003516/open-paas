@@ -156,8 +156,16 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func runPipeline(repoURL, subdomain string) {
+	// Generate unique names based on the subdomain
+	containerName := "app"
+	if subdomain != "" {
+		containerName = "app-" + subdomain
+	}
+	imageName := containerName + "-image"
+	tunnelName := containerName + "-tunnel"
+
 	fmt.Println("🧹 Step 1: Cleaning up old deployments...")
-	exec.Command("docker", "rm", "-f", "my-app", "my-tunnel").Run()
+	exec.Command("docker", "rm", "-f", containerName, tunnelName).Run()
 	os.RemoveAll(".tmp-build")
 
 	fmt.Println("📥 Step 2: Cloning repository...")
@@ -175,7 +183,7 @@ func runPipeline(repoURL, subdomain string) {
 		"-e", "DOCKER_BUILDKIT=0",
 		"-v", "/var/run/docker.sock:/var/run/docker.sock", 
 		"-v", repoPath+":/app", 
-		"open-paas-builder", "build", "/app", "--name", "my-custom-app")
+		"open-paas-builder", "build", "/app", "--name", imageName)
 	
 	buildCmd.Stdout = os.Stdout
 	buildCmd.Stderr = os.Stderr
@@ -185,20 +193,26 @@ func runPipeline(repoURL, subdomain string) {
 		return
 	}
 
-	fmt.Println("📦 Step 4: Spinning up application...")
+	fmt.Println("📦 Step 4: Provisioning Edge Database & Spinning up application...")
+	volumeName := containerName + "-data"
+	exec.Command("docker", "volume", "create", volumeName).Run()
+
 	err = exec.Command("docker", "run", "-d", 
 		"--cpus", "0.5", 
 		"--memory", "512m", 
 		"--pids-limit", "100", 
 		"--security-opt", "no-new-privileges:true", 
-		"-e", "PORT=3000", "--name", "my-app", "my-custom-app").Run()
+		"-v", volumeName+":/data", 
+		"-e", "PORT=3000", 
+		"-e", "DATABASE_URL=sqlite:///data/sqlite.db", 
+		"--name", containerName, imageName).Run()
 	if err != nil {
 		fmt.Printf("❌ Failed to start app container: %v\n", err)
 		return
 	}
 
 	fmt.Println("☁️  Step 5: Provisioning Tunnel...")
-	tunnelArgs := []string{"run", "-d", "--name", "my-tunnel", "--link", "my-app", "node:18-alpine", "npx", "localtunnel", "--port", "3000", "--local-host", "my-app"}
+	tunnelArgs := []string{"run", "-d", "--name", tunnelName, "--link", containerName, "node:18-alpine", "npx", "localtunnel", "--port", "3000", "--local-host", containerName}
 	if subdomain != "" {
 		tunnelArgs = append(tunnelArgs, "--subdomain", subdomain)
 	}
@@ -212,7 +226,7 @@ func runPipeline(repoURL, subdomain string) {
 	fmt.Println("⏳ Waiting for Tunnel...")
 	time.Sleep(6 * time.Second)
 
-	logs, _ := exec.Command("docker", "logs", "my-tunnel").CombinedOutput()
+	logs, _ := exec.Command("docker", "logs", tunnelName).CombinedOutput()
 	re := regexp.MustCompile(`https://[a-zA-Z0-9-]+\.loca\.lt`)
 	match := re.FindString(string(logs))
 
