@@ -164,7 +164,12 @@ func runPipeline(repoURL, subdomain string) {
 	}
 
 	fmt.Println("📦 Step 4: Spinning up application...")
-	err = exec.Command("docker", "run", "-d", "-e", "PORT=3000", "--name", "my-app", "my-custom-app").Run()
+	err = exec.Command("docker", "run", "-d", 
+		"--cpus", "0.5", 
+		"--memory", "512m", 
+		"--pids-limit", "100", 
+		"--security-opt", "no-new-privileges:true", 
+		"-e", "PORT=3000", "--name", "my-app", "my-custom-app").Run()
 	if err != nil {
 		fmt.Printf("❌ Failed to start app container: %v\n", err)
 		return

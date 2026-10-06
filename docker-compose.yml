@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  # The Backend Engine (Go)
+  engine:
+    build: 
+      context: .
+      dockerfile: Dockerfile.builder
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+    networks:
+      - paas-network
+
+  # The Frontend Dashboard (Next.js)
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_ENGINE_URL=http://localhost:8080
+    depends_on:
+      - engine
+    networks:
+      - paas-network
+
+networks:
+  paas-network:
+    driver: bridge
