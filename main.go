@@ -45,6 +45,7 @@ func main() {
 	http.HandleFunc("/deploy", enableCORS(webhookHandler)) // Same as webhook for now
 	http.HandleFunc("/deployments", enableCORS(getDeploymentsHandler))
 	http.HandleFunc("/logs", enableCORS(getLogsHandler))
+	http.HandleFunc("/restart", enableCORS(restartHandler))
 
 	fmt.Println("🚀 Open-PaaS Engine started on port 8080")
 	fmt.Println("API Endpoints Ready:")
@@ -52,8 +53,29 @@ func main() {
 	fmt.Println(" - POST /deploy  (Dashboard manual deploy)")
 	fmt.Println(" - GET  /deployments (List running apps)")
 	fmt.Println(" - GET  /logs?container=my-app (Stream logs)")
+	fmt.Println(" - POST /restart?container=my-app (Restart container)")
 	
 	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+// Endpoint: POST /restart
+func restartHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	containerName := r.URL.Query().Get("container")
+	if containerName == "" {
+		http.Error(w, "Missing container query param", http.StatusBadRequest)
+		return
+	}
+	err := exec.Command("docker", "restart", containerName).Run()
+	if err != nil {
+		http.Error(w, "Failed to restart container", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Container restarted successfully"))
 }
 
 // Endpoint: GET /deployments
