@@ -4,6 +4,7 @@ import { useState, useEffect, useRef } from "react";
 export default function Dashboard() {
   const [deployments, setDeployments] = useState([]);
   const [repoUrl, setRepoUrl] = useState("https://github.com/heroku/node-js-getting-started");
+  const [subdomain, setSubdomain] = useState("");
   const [logs, setLogs] = useState("Waiting for logs...");
   const [isDeploying, setIsDeploying] = useState(false);
   const logsEndRef = useRef<HTMLDivElement>(null);
@@ -57,7 +58,7 @@ export default function Dashboard() {
       await fetch("http://localhost:8080/deploy", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ repo_url: repoUrl }),
+        body: JSON.stringify({ repo_url: repoUrl, subdomain: subdomain }),
       });
       setLogs("Deployment started! Fetching logs...");
     } catch (err) {
@@ -88,8 +89,9 @@ export default function Dashboard() {
             <div className="bg-[#111] p-6 rounded-lg border border-[#333] shadow-lg">
               <h2 className="text-xl font-semibold text-white mb-4">Deploy New Project</h2>
               <p className="text-sm text-gray-400 mb-4">
-                Paste a GitHub URL. Nixpacks will auto-detect the language, build a Docker image, and tunnel it via Cloudflare.
+                Paste a GitHub URL. Nixpacks will auto-detect the language, build a Docker image, and tunnel it publicly.
               </p>
+              <label className="block text-xs font-semibold text-gray-400 mb-2 uppercase">GitHub Repository URL</label>
               <input
                 type="text"
                 value={repoUrl}
@@ -97,6 +99,19 @@ export default function Dashboard() {
                 className="w-full bg-[#222] border border-[#444] rounded px-4 py-2 text-white focus:outline-none focus:border-white mb-4"
                 placeholder="https://github.com/..."
               />
+              <label className="block text-xs font-semibold text-gray-400 mb-2 uppercase">Custom Subdomain (Optional)</label>
+              <div className="flex mb-4">
+                <input
+                  type="text"
+                  value={subdomain}
+                  onChange={(e) => setSubdomain(e.target.value)}
+                  className="w-full bg-[#222] border border-[#444] rounded-l px-4 py-2 text-white focus:outline-none focus:border-white"
+                  placeholder="my-cool-app"
+                />
+                <span className="bg-[#333] border border-[#444] border-l-0 rounded-r px-3 py-2 text-gray-400 text-sm flex items-center">
+                  .loca.lt
+                </span>
+              </div>
               <button
                 onClick={handleDeploy}
                 disabled={isDeploying}
@@ -133,7 +148,7 @@ export default function Dashboard() {
           <div className="lg:col-span-2">
             <div className="bg-[#0c0c0c] h-[600px] rounded-lg border border-[#333] shadow-lg flex flex-col overflow-hidden">
               <div className="bg-[#1a1a1a] px-4 py-2 border-b border-[#333] flex items-center justify-between">
-                <span className="text-xs font-mono text-gray-400 uppercase tracking-wider">Cloudflare Tunnel Logs</span>
+                <span className="text-xs font-mono text-gray-400 uppercase tracking-wider">Tunnel Network Logs</span>
                 <div className="flex gap-2">
                   <div className="w-3 h-3 rounded-full bg-red-500"></div>
                   <div className="w-3 h-3 rounded-full bg-yellow-500"></div>

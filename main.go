@@ -14,7 +14,8 @@ import (
 )
 
 type WebhookPayload struct {
-	RepoURL string `json:"repo_url"`
+	RepoURL   string `json:"repo_url"`
+	Subdomain string `json:"subdomain"`
 }
 
 type Deployment struct {
@@ -112,21 +113,27 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	repoURL := "https://github.com/heroku/node-js-getting-started"
+	subdomain := ""
 	var payload WebhookPayload
-	if err := json.NewDecoder(r.Body).Decode(&payload); err == nil && payload.RepoURL != "" {
-		repoURL = payload.RepoURL
+	if err := json.NewDecoder(r.Body).Decode(&payload); err == nil {
+		if payload.RepoURL != "" {
+			repoURL = payload.RepoURL
+		}
+		if payload.Subdomain != "" {
+			subdomain = payload.Subdomain
+		}
 	}
 
-	fmt.Printf("\n🔔 Deployment triggered for: %s\n", repoURL)
+	fmt.Printf("\n🔔 Deployment triggered for: %s (Subdomain: %s)\n", repoURL, subdomain)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"status": "Deploying", "repo": "` + repoURL + `"}`))
 
-	go runPipeline(repoURL)
+	go runPipeline(repoURL, subdomain)
 }
 
-func runPipeline(repoURL string) {
+func runPipeline(repoURL, subdomain string) {
 	fmt.Println("🧹 Step 1: Cleaning up old deployments...")
 	exec.Command("docker", "rm", "-f", "my-app", "my-tunnel").Run()
 	os.RemoveAll(".tmp-build")
@@ -163,23 +170,28 @@ func runPipeline(repoURL string) {
 		return
 	}
 
-	fmt.Println("☁️  Step 5: Provisioning Cloudflare Tunnel...")
-	err = exec.Command("docker", "run", "-d", "--name", "my-tunnel", "--link", "my-app", "cloudflare/cloudflared", "tunnel", "--url", "http://my-app:3000").Run()
+	fmt.Println("☁️  Step 5: Provisioning Tunnel...")
+	tunnelArgs := []string{"run", "-d", "--name", "my-tunnel", "--link", "my-app", "node:18-alpine", "npx", "localtunnel", "--port", "3000", "--local-host", "my-app"}
+	if subdomain != "" {
+		tunnelArgs = append(tunnelArgs, "--subdomain", subdomain)
+	}
+
+	err = exec.Command("docker", tunnelArgs...).Run()
 	if err != nil {
 		fmt.Printf("❌ Failed to start tunnel: %v\n", err)
 		return
 	}
 
-	fmt.Println("⏳ Waiting for Cloudflare...")
+	fmt.Println("⏳ Waiting for Tunnel...")
 	time.Sleep(6 * time.Second)
 
 	logs, _ := exec.Command("docker", "logs", "my-tunnel").CombinedOutput()
-	re := regexp.MustCompile(`https://[a-zA-Z0-9-]+\.trycloudflare\.com`)
+	re := regexp.MustCompile(`https://[a-zA-Z0-9-]+\.loca\.lt`)
 	match := re.FindString(string(logs))
 
 	if match != "" {
 		fmt.Printf("\n✅ SUCCESS! LIVE at: 🌐 %s\n\n", match)
 	} else {
-		fmt.Println("⚠️  Could not parse Cloudflare URL yet. Check logs.")
+		fmt.Println("⚠️  Could not parse Tunnel URL yet. Check logs.")
 	}
 }
