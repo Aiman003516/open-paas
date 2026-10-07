@@ -2,7 +2,7 @@ FROM golang:1.21-alpine
 
 RUN apk add --no-cache docker-cli git curl bash
 # Install Wasmtime
-RUN curl https://wasmtime.dev/install.sh -sSf | bash
+RUN touch ~/.bashrc && curl https://wasmtime.dev/install.sh -sSf | bash
 ENV PATH="/root/.wasmtime/bin:$PATH"
 
 WORKDIR /app
