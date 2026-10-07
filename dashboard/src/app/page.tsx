@@ -2,23 +2,33 @@
 import { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { 
-  Rocket, Github, Terminal, Server, Activity, 
+  Rocket, Terminal, Server, Activity, 
   Globe, Box, Cpu, Clock, Code2, PlayCircle, Plus
 } from "lucide-react";
 
 export default function Dashboard() {
-  const [deployments, setDeployments] = useState([]);
+  const [deployments, setDeployments] = useState<any[]>([]);
   const [repoUrl, setRepoUrl] = useState("https://github.com/heroku/node-js-getting-started");
   const [subdomain, setSubdomain] = useState("");
   const [logs, setLogs] = useState("System initialized. Awaiting deployments...");
   const [isDeploying, setIsDeploying] = useState(false);
   const logsEndRef = useRef<HTMLDivElement>(null);
 
+  // Determine the API URL dynamically
+  const getEngineUrl = () => {
+    if (typeof window === "undefined") return "http://localhost:8080";
+    if (window.location.hostname.includes("sbx.sandboxes-cloud.docker.com")) {
+      return window.location.origin.replace("3000-", "8080-");
+    }
+    return "http://localhost:8080";
+  };
+  const ENGINE_URL = getEngineUrl();
+
   // Fetch Deployments
   useEffect(() => {
     const fetchDeployments = async () => {
       try {
-        const res = await fetch("http://localhost:8080/deployments");
+        const res = await fetch(`${ENGINE_URL}/deployments`);
         if (res.ok) {
           const data = await res.json();
           setDeployments(data || []);
@@ -42,7 +52,7 @@ export default function Dashboard() {
            activeContainer = deployments[0].name;
         }
 
-        const res = await fetch(`http://localhost:8080/logs?container=${activeContainer}`);
+        const res = await fetch(`${ENGINE_URL}/logs?container=${activeContainer}`);
         if (res.ok) {
           const text = await res.text();
           if (text) setLogs(text);
@@ -67,7 +77,7 @@ export default function Dashboard() {
     setIsDeploying(true);
     setLogs((prev) => prev + "\n[SYSTEM] Initiating deployment for " + repoUrl + "...\n");
     try {
-      await fetch("http://localhost:8080/deploy", {
+      await fetch(`${ENGINE_URL}/deploy`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ repo_url: repoUrl, subdomain: subdomain }),
@@ -104,7 +114,7 @@ export default function Dashboard() {
             <a href="#" className="hover:text-white transition-colors flex items-center gap-2"><Globe className="w-4 h-4"/> Edge Network</a>
             <a href="#" className="hover:text-white transition-colors flex items-center gap-2"><Cpu className="w-4 h-4"/> MicroVMs</a>
             <a href="https://github.com/Aiman003516/open-paas" target="_blank" className="hover:text-white transition-colors flex items-center gap-2">
-              <Github className="w-4 h-4" /> GitHub
+              <Code2 className="w-4 h-4" /> GitHub
             </a>
           </div>
         </div>
@@ -136,7 +146,7 @@ export default function Dashboard() {
                 <div className="space-y-5">
                   <div>
                     <label className="block text-xs font-semibold text-gray-400 mb-2 uppercase tracking-wider flex items-center gap-2">
-                      <Github className="w-3 h-3" /> Repository URL
+                      <Code2 className="w-3 h-3" /> Repository URL
                     </label>
                     <div className="relative group">
                       <input
