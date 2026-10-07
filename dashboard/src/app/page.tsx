@@ -1,326 +1,358 @@
 "use client";
-import { useState, useEffect, useRef } from "react";
-import { motion, AnimatePresence } from "framer-motion";
-import { 
-  Rocket, Terminal, Server, Activity, 
-  Globe, Box, Cpu, Clock, Code2, PlayCircle, Plus
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Activity,
+  ArrowUpRight,
+  Box,
+  Check,
+  CircleAlert,
+  Clock3,
+  Code2,
+  ExternalLink,
+  LoaderCircle,
+  Plus,
+  RefreshCw,
+  Rocket,
+  Server,
+  TerminalSquare,
+  Wifi,
+  WifiOff,
 } from "lucide-react";
 
+type Deployment = {
+  id: string;
+  name: string;
+  status: string;
+};
+
+type EngineState = "checking" | "connected" | "offline";
+
+const ENGINE_URL = "/api/engine";
+const REPOSITORY_PATTERN = /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\.git)?\/?$/i;
+const SUBDOMAIN_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+
+function statusIsRunning(status: string) {
+  return /^Up\b/i.test(status);
+}
+
 export default function Dashboard() {
-  const [deployments, setDeployments] = useState<any[]>([]);
-  const [repoUrl, setRepoUrl] = useState("https://github.com/heroku/node-js-getting-started");
+  const [deployments, setDeployments] = useState<Deployment[]>([]);
+  const [repoUrl, setRepoUrl] = useState("");
   const [subdomain, setSubdomain] = useState("");
-  const [logs, setLogs] = useState("System initialized. Awaiting deployments...");
+  const [logs, setLogs] = useState("");
+  const [engineState, setEngineState] = useState<EngineState>("checking");
   const [isDeploying, setIsDeploying] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [notice, setNotice] = useState<{ kind: "success" | "error"; text: string } | null>(null);
+  const [selectedContainer, setSelectedContainer] = useState("");
+  const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
   const logsEndRef = useRef<HTMLDivElement>(null);
 
-  // Determine the API URL dynamically
-  const getEngineUrl = () => {
-    if (typeof window === "undefined") return "http://localhost:8080";
-    if (window.location.hostname.includes("sbx.sandboxes-cloud.docker.com")) {
-      return window.location.origin.replace("3000-", "8080-");
+  const runningCount = useMemo(
+    () => deployments.filter((deployment) => statusIsRunning(deployment.status)).length,
+    [deployments],
+  );
+  const chosenContainer = deployments.some((deployment) => deployment.name === selectedContainer)
+    ? selectedContainer
+    : deployments[0]?.name || "";
+  const repoIsValid = REPOSITORY_PATTERN.test(repoUrl.trim());
+  const subdomainIsValid = !subdomain.trim() || SUBDOMAIN_PATTERN.test(subdomain.trim().toLowerCase());
+  const refresh = useCallback(async (showSpinner = false) => {
+    if (showSpinner) setIsRefreshing(true);
+    try {
+      const [healthResponse, deploymentsResponse] = await Promise.all([
+        fetch(`${ENGINE_URL}/health`, { cache: "no-store" }),
+        fetch(`${ENGINE_URL}/deployments`, { cache: "no-store" }),
+      ]);
+      if (!healthResponse.ok || !deploymentsResponse.ok) throw new Error("The engine returned an error.");
+      const nextDeployments = (await deploymentsResponse.json()) as Deployment[];
+      setDeployments(Array.isArray(nextDeployments) ? nextDeployments : []);
+      setEngineState("connected");
+      setUpdatedAt(new Date());
+    } catch {
+      setEngineState("offline");
+    } finally {
+      if (showSpinner) setIsRefreshing(false);
     }
-    return "http://localhost:8080";
-  };
-  const ENGINE_URL = getEngineUrl();
-
-  // Fetch Deployments
-  useEffect(() => {
-    const fetchDeployments = async () => {
-      try {
-        const res = await fetch(`${ENGINE_URL}/deployments`);
-        if (res.ok) {
-          const data = await res.json();
-          setDeployments(data || []);
-        }
-      } catch (err) {
-        console.error("Failed to fetch deployments", err);
-      }
-    };
-    fetchDeployments();
-    const interval = setInterval(fetchDeployments, 3000);
-    return () => clearInterval(interval);
   }, []);
 
-  // Fetch Logs
   useEffect(() => {
-    const fetchLogs = async () => {
-      try {
-        // Find the most recent active container name to stream its logs
-        let activeContainer = "my-tunnel";
-        if (deployments.length > 0) {
-           activeContainer = deployments[0].name;
-        }
+    const initialLoad = window.setTimeout(() => void refresh(), 0);
+    const interval = window.setInterval(() => void refresh(), 8000);
+    return () => {
+      window.clearTimeout(initialLoad);
+      window.clearInterval(interval);
+    };
+  }, [refresh]);
 
-        const res = await fetch(`${ENGINE_URL}/logs?container=${activeContainer}`);
-        if (res.ok) {
-          const text = await res.text();
-          if (text) setLogs(text);
-        }
-      } catch (err) {
-        // ignore log errors
+  useEffect(() => {
+    if (!chosenContainer) {
+      return;
+    }
+    let cancelled = false;
+    const loadLogs = async () => {
+      try {
+        const response = await fetch(
+          `${ENGINE_URL}/logs?container=${encodeURIComponent(chosenContainer)}`,
+          { cache: "no-store" },
+        );
+        const text = await response.text();
+        if (!cancelled) setLogs(response.ok ? text : text || "Unable to load logs.");
+      } catch {
+        if (!cancelled) setLogs("Could not reach the engine to load logs.");
       }
     };
-    fetchLogs();
-    const interval = setInterval(fetchLogs, 2000);
-    return () => clearInterval(interval);
-  }, [deployments]);
+    void loadLogs();
+    const interval = window.setInterval(() => void loadLogs(), 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [chosenContainer]);
 
-  // Auto-scroll logs
   useEffect(() => {
-    if (logsEndRef.current) {
-      logsEndRef.current.scrollIntoView({ behavior: "smooth" });
-    }
+    logsEndRef.current?.scrollIntoView({ block: "nearest" });
   }, [logs]);
 
-  const handleDeploy = async () => {
+  async function handleDeploy(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setNotice(null);
+    if (!repoIsValid) {
+      setNotice({ kind: "error", text: "Enter a valid public GitHub repository URL, such as https://github.com/owner/project." });
+      return;
+    }
+    if (!subdomainIsValid) {
+      setNotice({ kind: "error", text: "Use lowercase letters, numbers, and hyphens for the subdomain." });
+      return;
+    }
+
     setIsDeploying(true);
-    setLogs((prev) => prev + "\n[SYSTEM] Initiating deployment for " + repoUrl + "...\n");
     try {
-      await fetch(`${ENGINE_URL}/deploy`, {
+      const response = await fetch(`${ENGINE_URL}/deploy`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ repo_url: repoUrl, subdomain: subdomain }),
+        body: JSON.stringify({ repo_url: repoUrl.trim(), subdomain: subdomain.trim().toLowerCase() }),
       });
-    } catch (err) {
-      console.error(err);
-      setLogs((prev) => prev + "\n[ERROR] Failed to connect to Engine.\n");
+      const body = (await response.json().catch(() => ({}))) as { error?: string; status?: string };
+      if (!response.ok) throw new Error(body.error || "The deployment request was rejected.");
+      setNotice({ kind: "success", text: "Deploy request received. Your app will appear here when its container starts." });
+      setRepoUrl("");
+      await refresh();
+    } catch (error) {
+      setNotice({
+        kind: "error",
+        text: error instanceof Error ? error.message : "Could not send the deployment request.",
+      });
+    } finally {
+      setIsDeploying(false);
     }
-    setTimeout(() => setIsDeploying(false), 2000);
-  };
+  }
+
+  const engineLabel = engineState === "connected" ? "Engine connected" : engineState === "checking" ? "Checking engine" : "Engine offline";
 
   return (
-    <div className="min-h-screen bg-[#050505] text-gray-200 font-sans selection:bg-indigo-500/30 overflow-hidden relative">
-      
-      {/* Background Gradients */}
-      <div className="absolute top-[-20%] left-[-10%] w-[50%] h-[50%] bg-indigo-600/10 blur-[120px] rounded-full pointer-events-none" />
-      <div className="absolute bottom-[-20%] right-[-10%] w-[50%] h-[50%] bg-fuchsia-600/10 blur-[120px] rounded-full pointer-events-none" />
-
-      {/* Navbar */}
-      <nav className="sticky top-0 z-50 border-b border-white/5 bg-black/40 backdrop-blur-xl">
-        <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center shadow-lg shadow-indigo-500/20">
-              <Rocket className="w-5 h-5 text-white" />
-            </div>
-            <span className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-white to-gray-400">
-              Open-PaaS
+    <main className="app-shell min-h-screen">
+      <header className="topbar">
+        <div className="topbar-inner">
+          <a href="#home" className="brand" aria-label="Open-PaaS home">
+            <span className="brand-mark"><Rocket size={18} strokeWidth={2.2} /></span>
+            <span>open<span className="brand-light">-paas</span></span>
+            <span className="personal-tag">personal cloud</span>
+          </a>
+          <div className="topbar-actions">
+            <span className={`connection-pill ${engineState}`} role="status">
+              {engineState === "connected" ? <Wifi size={14} /> : engineState === "offline" ? <WifiOff size={14} /> : <LoaderCircle size={14} className="spin" />}
+              {engineLabel}
             </span>
-            <span className="px-2 py-0.5 rounded-full bg-white/10 text-xs font-medium text-gray-300 ml-2 border border-white/5">
-              Enterprise Engine
-            </span>
-          </div>
-          <div className="flex items-center gap-6 text-sm font-medium text-gray-400">
-            <a href="#" className="hover:text-white transition-colors flex items-center gap-2"><Globe className="w-4 h-4"/> Edge Network</a>
-            <a href="#" className="hover:text-white transition-colors flex items-center gap-2"><Cpu className="w-4 h-4"/> MicroVMs</a>
-            <a href="https://github.com/Aiman003516/open-paas" target="_blank" className="hover:text-white transition-colors flex items-center gap-2">
-              <Code2 className="w-4 h-4" /> GitHub
+            <a className="github-link" href="https://github.com/Aiman003516/open-paas" target="_blank" rel="noreferrer">
+              <Code2 size={16} /> <span>GitHub</span><ExternalLink size={13} />
             </a>
           </div>
         </div>
-      </nav>
+      </header>
 
-      <div className="max-w-7xl mx-auto px-6 py-12">
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 relative z-10">
-          
-          {/* Left Column (Forms & List) */}
-          <div className="lg:col-span-5 flex flex-col gap-8">
-            
-            {/* Deploy Card */}
-            <motion.div 
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              className="relative p-[1px] rounded-2xl bg-gradient-to-b from-white/15 to-white/5 shadow-2xl"
-            >
-              <div className="bg-[#0a0a0a] p-8 rounded-2xl w-full h-full">
-                <div className="flex items-center gap-3 mb-6">
-                  <div className="p-2 bg-indigo-500/10 rounded-lg text-indigo-400">
-                    <Plus className="w-6 h-6" />
-                  </div>
-                  <div>
-                    <h2 className="text-xl font-semibold text-white">New Deployment</h2>
-                    <p className="text-sm text-gray-400">Deploy any Git repository instantly.</p>
-                  </div>
-                </div>
-
-                <div className="space-y-5">
-                  <div>
-                    <label className="block text-xs font-semibold text-gray-400 mb-2 uppercase tracking-wider flex items-center gap-2">
-                      <Code2 className="w-3 h-3" /> Repository URL
-                    </label>
-                    <div className="relative group">
-                      <input
-                        type="text"
-                        value={repoUrl}
-                        onChange={(e) => setRepoUrl(e.target.value)}
-                        className="w-full bg-[#111] border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-indigo-500/50 focus:ring-1 focus:ring-indigo-500/50 transition-all"
-                        placeholder="https://github.com/..."
-                      />
-                    </div>
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-semibold text-gray-400 mb-2 uppercase tracking-wider flex items-center gap-2">
-                      <Globe className="w-3 h-3" /> Custom Subdomain (Optional)
-                    </label>
-                    <div className="flex rounded-xl overflow-hidden border border-white/10 focus-within:border-indigo-500/50 focus-within:ring-1 focus-within:ring-indigo-500/50 transition-all">
-                      <input
-                        type="text"
-                        value={subdomain}
-                        onChange={(e) => setSubdomain(e.target.value)}
-                        className="w-full bg-[#111] px-4 py-3 text-white focus:outline-none"
-                        placeholder="my-cool-app"
-                      />
-                      <span className="bg-[#1a1a1a] px-4 py-3 text-gray-500 text-sm flex items-center font-mono border-l border-white/10">
-                        .loca.lt
-                      </span>
-                    </div>
-                  </div>
-
-                  <button
-                    onClick={handleDeploy}
-                    disabled={isDeploying}
-                    className="relative w-full overflow-hidden rounded-xl font-semibold py-3 text-white transition-all active:scale-[0.98] disabled:opacity-70 disabled:active:scale-100 group mt-2"
-                  >
-                    <div className="absolute inset-0 bg-gradient-to-r from-indigo-500 to-purple-600 transition-opacity group-hover:opacity-90" />
-                    {isDeploying ? (
-                      <span className="relative flex items-center justify-center gap-2">
-                        <Activity className="w-5 h-5 animate-pulse" /> Deploying...
-                      </span>
-                    ) : (
-                      <span className="relative flex items-center justify-center gap-2 text-[15px]">
-                        <PlayCircle className="w-5 h-5" /> Deploy Application
-                      </span>
-                    )}
-                  </button>
-                </div>
-              </div>
-            </motion.div>
-
-            {/* Active Apps Card */}
-            <motion.div 
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 0.1 }}
-              className="relative p-[1px] rounded-2xl bg-gradient-to-b from-white/10 to-transparent flex-1 flex flex-col"
-            >
-              <div className="bg-[#0a0a0a] p-6 rounded-2xl w-full h-full flex flex-col">
-                <div className="flex justify-between items-center mb-6">
-                  <div className="flex items-center gap-3">
-                     <div className="p-2 bg-emerald-500/10 rounded-lg text-emerald-400">
-                      <Server className="w-5 h-5" />
-                    </div>
-                    <h2 className="text-lg font-semibold text-white">Active Instances</h2>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs text-gray-500 font-medium">LIVE</span>
-                    <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse shadow-[0_0_10px_rgba(16,185,129,0.5)]"></div>
-                  </div>
-                </div>
-
-                {deployments.length === 0 ? (
-                  <div className="flex-1 flex flex-col items-center justify-center text-gray-500 py-10 border border-dashed border-white/10 rounded-xl bg-white/[0.02]">
-                    <Box className="w-10 h-10 mb-3 opacity-20" />
-                    <p className="text-sm">No instances running</p>
-                  </div>
-                ) : (
-                  <ul className="space-y-3 overflow-y-auto max-h-[300px] pr-2 custom-scrollbar">
-                    <AnimatePresence>
-                      {deployments.map((dep: any, i: number) => (
-                        <motion.li 
-                          key={dep.name + i}
-                          initial={{ opacity: 0, x: -10 }}
-                          animate={{ opacity: 1, x: 0 }}
-                          exit={{ opacity: 0, height: 0 }}
-                          className="group flex flex-col p-4 bg-[#111] hover:bg-[#161616] transition-colors rounded-xl border border-white/5 hover:border-white/10"
-                        >
-                          <div className="flex justify-between items-center mb-2">
-                            <span className="font-mono text-sm text-gray-200 truncate pr-4">{dep.name}</span>
-                            <span className={`text-[10px] uppercase tracking-widest px-2.5 py-1 rounded-full font-bold border ${dep.status.includes('Up') ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' : 'bg-amber-500/10 text-amber-400 border-amber-500/20'}`}>
-                              {dep.status.split(' ')[0]}
-                            </span>
-                          </div>
-                          <div className="flex items-center gap-4 text-xs text-gray-500 font-mono">
-                            <span className="flex items-center gap-1"><Clock className="w-3 h-3"/> {dep.status.replace(/Up [a-zA-Z0-9 ]+/, '') || 'Running'}</span>
-                            <span className="flex items-center gap-1"><Code2 className="w-3 h-3"/> {dep.id.substring(0, 8)}</span>
-                          </div>
-                        </motion.li>
-                      ))}
-                    </AnimatePresence>
-                  </ul>
-                )}
-              </div>
-            </motion.div>
+      <div className="page-wrap" id="home">
+        <section className="welcome-row">
+          <div>
+            <p className="eyebrow"><span className="eyebrow-dot" /> YOUR PROJECTS, YOUR MACHINE</p>
+            <h1>Good things start <span>with a deploy.</span></h1>
+            <p className="welcome-copy">A small, self-hosted home for the apps you&apos;re building.</p>
           </div>
+          <button className="refresh-button" onClick={() => void refresh(true)} disabled={isRefreshing} type="button">
+            <RefreshCw size={15} className={isRefreshing ? "spin" : ""} />
+            {isRefreshing ? "Refreshing" : "Refresh"}
+          </button>
+        </section>
 
-          {/* Right Column (Terminal) */}
-          <motion.div 
-            initial={{ opacity: 0, x: 20 }}
-            animate={{ opacity: 1, x: 0 }}
-            transition={{ delay: 0.2 }}
-            className="lg:col-span-7 h-[800px] lg:h-auto flex flex-col"
-          >
-            <div className="relative p-[1px] rounded-2xl bg-gradient-to-b from-white/15 to-white/5 shadow-2xl flex-1 flex flex-col">
-              <div className="bg-[#050505] rounded-2xl w-full h-full flex flex-col overflow-hidden">
-                
-                {/* Terminal Header */}
-                <div className="bg-[#0a0a0a] border-b border-white/5 px-4 py-3 flex items-center justify-between">
-                  <div className="flex items-center gap-4">
-                    <div className="flex gap-2">
-                      <div className="w-3 h-3 rounded-full bg-red-500/80 border border-red-500/20 shadow-[0_0_10px_rgba(239,68,68,0.2)]"></div>
-                      <div className="w-3 h-3 rounded-full bg-amber-500/80 border border-amber-500/20 shadow-[0_0_10px_rgba(245,158,11,0.2)]"></div>
-                      <div className="w-3 h-3 rounded-full bg-emerald-500/80 border border-emerald-500/20 shadow-[0_0_10px_rgba(16,185,129,0.2)]"></div>
-                    </div>
-                    <div className="h-4 w-[1px] bg-white/10"></div>
-                    <span className="text-xs font-mono text-gray-400 flex items-center gap-2">
-                      <Terminal className="w-3.5 h-3.5" /> Engine Telemetry
-                    </span>
-                  </div>
-                  <div className="text-[10px] font-mono text-gray-600 bg-white/5 px-2 py-1 rounded">bash - 80x24</div>
-                </div>
+        <section className="summary-grid" aria-label="Project summary">
+          <article className="summary-card">
+            <div className="summary-icon violet"><Box size={18} /></div>
+            <div><p className="summary-label">RUNNING APPS</p><p className="summary-value">{engineState === "connected" ? runningCount : "—"}</p></div>
+            <span className="summary-foot">{engineState === "connected" ? `${deployments.length} total` : "Waiting for engine"}</span>
+          </article>
+          <article className="summary-card">
+            <div className={`summary-icon ${engineState === "connected" ? "green" : engineState === "offline" ? "red" : "amber"}`}><Activity size={18} /></div>
+            <div><p className="summary-label">LOCAL ENGINE</p><p className="summary-value summary-state">{engineState === "connected" ? "Ready" : engineState === "checking" ? "Checking" : "Offline"}</p></div>
+            <span className="summary-foot">{updatedAt ? `Updated ${updatedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "Connect to get started"}</span>
+          </article>
+          <article className="summary-card summary-note">
+            <div className="summary-icon blue"><Code2 size={18} /></div>
+            <div><p className="summary-label">BUILT FOR</p><p className="summary-value summary-state">Your next idea</p></div>
+            <span className="summary-foot">No team setup. Just you and your code.</span>
+          </article>
+        </section>
 
-                {/* Terminal Body */}
-                <div className="flex-1 p-5 font-mono text-[13px] leading-relaxed overflow-y-auto bg-black text-gray-300 custom-scrollbar">
-                  {logs.split('\n').map((line, i) => {
-                    let colorClass = "text-gray-300";
-                    if (line.includes("ERROR") || line.includes("Failed")) colorClass = "text-red-400";
-                    else if (line.includes("WARN")) colorClass = "text-yellow-400";
-                    else if (line.includes("SUCCESS") || line.includes("LIVE")) colorClass = "text-emerald-400 font-bold";
-                    else if (line.includes("Step") || line.includes("Building")) colorClass = "text-indigo-300";
-                    else if (line.includes("http")) colorClass = "text-cyan-400 underline decoration-cyan-400/30 underline-offset-4";
-                    
-                    return (
-                      <div key={i} className={`mb-1 break-words ${colorClass}`}>
-                        <span className="text-gray-700 select-none mr-3">{String(i + 1).padStart(3, '0')}</span>
-                        {line}
-                      </div>
-                    );
-                  })}
-                  <div ref={logsEndRef} className="h-4" />
-                </div>
-              </div>
+        <div className="workspace-grid">
+          <section className="panel deploy-panel" aria-labelledby="deploy-heading">
+            <div className="panel-heading">
+              <div className="heading-icon violet"><Plus size={19} /></div>
+              <div><p className="section-kicker">START SOMETHING</p><h2 id="deploy-heading">New deployment</h2></div>
+              <span className="step-tag">01</span>
             </div>
-          </motion.div>
+            <p className="panel-intro">Point to a public GitHub repo and let your local engine take it from there.</p>
+            <form onSubmit={handleDeploy} noValidate>
+              <div className="field-group">
+                <label htmlFor="repo-url">Repository URL</label>
+                <div className={`input-wrap ${repoUrl && !repoIsValid ? "input-invalid" : ""}`}>
+                  <Code2 size={17} aria-hidden="true" />
+                  <input
+                    id="repo-url"
+                    type="url"
+                    autoComplete="url"
+                    value={repoUrl}
+                    onChange={(event) => setRepoUrl(event.target.value)}
+                    placeholder="https://github.com/you/your-project"
+                    aria-describedby="repo-help"
+                  />
+                  {repoUrl && repoIsValid && <Check size={16} className="input-check" aria-label="Valid GitHub URL" />}
+                </div>
+                <p id="repo-help" className="field-hint">Public GitHub repositories only, for now.</p>
+              </div>
+              <div className="field-group">
+                <label htmlFor="subdomain">Custom address <span className="optional">OPTIONAL</span></label>
+                <div className={`input-wrap subdomain-wrap ${subdomain && !subdomainIsValid ? "input-invalid" : ""}`}>
+                  <span className="subdomain-prefix">https://</span>
+                  <input
+                    id="subdomain"
+                    type="text"
+                    autoCapitalize="none"
+                    autoComplete="off"
+                    value={subdomain}
+                    onChange={(event) => setSubdomain(event.target.value)}
+                    placeholder="my-little-app"
+                    aria-describedby="subdomain-help"
+                  />
+                  <span className="subdomain-suffix">.loca.lt</span>
+                </div>
+                <p id="subdomain-help" className="field-hint">Letters, numbers, and hyphens. Leave blank for an automatic name.</p>
+              </div>
+              <button className="deploy-button" type="submit" disabled={engineState !== "connected" || isDeploying}>
+                {isDeploying ? <LoaderCircle size={17} className="spin" /> : <Rocket size={17} />}
+                {isDeploying ? "Sending your deploy…" : "Deploy project"}
+                {!isDeploying && <ArrowUpRight size={16} className="button-arrow" />}
+              </button>
+              {notice && (
+                <div className={`form-notice ${notice.kind}`} role="status">
+                  {notice.kind === "success" ? <Check size={16} /> : <CircleAlert size={16} />}
+                  <span>{notice.text}</span>
+                </div>
+              )}
+              {engineState === "offline" && (
+                <p className="offline-hint">Start the Open-PaaS engine and refresh to deploy.</p>
+              )}
+            </form>
+            <div className="safe-note"><span className="safe-note-dot" /> Only deploy code you trust on your own machine.</div>
+          </section>
 
+          <section className="panel apps-panel" aria-labelledby="apps-heading">
+            <div className="panel-heading apps-heading">
+              <div className="heading-icon green"><Server size={18} /></div>
+              <div><p className="section-kicker">WHAT&apos;S RUNNING</p><h2 id="apps-heading">Your apps</h2></div>
+              <span className="count-badge">{engineState === "connected" ? deployments.length : "—"}</span>
+            </div>
+            {engineState === "offline" ? (
+              <div className="empty-state">
+                <div className="empty-icon offline"><WifiOff size={22} /></div>
+                <h3>Can&apos;t reach your engine</h3>
+                <p>Make sure it&apos;s running on this machine, then try again.</p>
+                <button type="button" className="text-button" onClick={() => void refresh(true)}>Try again <ArrowUpRight size={14} /></button>
+              </div>
+            ) : engineState === "checking" ? (
+              <div className="empty-state"><div className="empty-icon"><LoaderCircle size={22} className="spin" /></div><h3>Finding your engine</h3><p>Checking for apps on your machine…</p></div>
+            ) : deployments.length === 0 ? (
+              <div className="empty-state">
+                <div className="empty-icon"><Box size={22} /></div>
+                <h3>A clean slate</h3>
+                <p>Your first deployed app will show up here. Ready when you are.</p>
+              </div>
+            ) : (
+              <ul className="app-list">
+                {deployments.map((deployment) => {
+                  const isRunning = statusIsRunning(deployment.status);
+                  return (
+                    <li key={deployment.id || deployment.name}>
+                      <button
+                        className={`app-row ${chosenContainer === deployment.name ? "selected" : ""}`}
+                        type="button"
+                        onClick={() => setSelectedContainer(deployment.name)}
+                        aria-pressed={chosenContainer === deployment.name}
+                        title={`Show logs for ${deployment.name}`}
+                      >
+                        <span className={`app-status-dot ${isRunning ? "running" : "stopped"}`} />
+                        <span className="app-details"><span className="app-name">{deployment.name.replace(/^open-paas-app-/, "")}</span><span className="app-runtime"><Clock3 size={12} /> {deployment.status || "Status unavailable"}</span></span>
+                        <span className={`status-label ${isRunning ? "running" : "stopped"}`}>{isRunning ? "Running" : "Stopped"}</span>
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+            <div className="apps-footer"><span><span className={`small-dot ${engineState === "connected" ? "online" : ""}`} /> {engineState === "connected" ? "Synced with your machine" : "Not connected"}</span><span>Refreshes every 8 sec</span></div>
+          </section>
         </div>
+
+        <section className="panel logs-panel" aria-labelledby="logs-heading">
+          <div className="logs-header">
+            <div className="panel-heading logs-title">
+              <div className="heading-icon dark"><TerminalSquare size={18} /></div>
+              <div><p className="section-kicker">A LOOK UNDER THE HOOD</p><h2 id="logs-heading">Recent logs</h2></div>
+            </div>
+            <div className="log-controls">
+              {deployments.length > 0 && (
+                <label className="sr-only" htmlFor="log-container">Choose app logs</label>
+              )}
+              {deployments.length > 0 && (
+                <select id="log-container" value={chosenContainer} onChange={(event) => setSelectedContainer(event.target.value)}>
+                  {deployments.map((deployment) => <option key={deployment.name} value={deployment.name}>{deployment.name.replace(/^open-paas-app-/, "")}</option>)}
+                </select>
+              )}
+              <span className="live-label"><span className="small-dot online" /> LIVE</span>
+            </div>
+          </div>
+          <div className="terminal-window" aria-live="polite" aria-label="Application logs">
+            <div className="terminal-topline"><span className="terminal-dots"><i /><i /><i /></span><span className="terminal-path">{chosenContainer || "your-app"} <span>/ logs</span></span><span className="terminal-mode">TAIL · 100 LINES</span></div>
+            <div className="terminal-content">
+              {!chosenContainer ? (
+                <div className="terminal-empty"><span className="terminal-prompt">$</span> Deploy an app to see its logs here<span className="cursor-block" /></div>
+              ) : logs.trim() ? (
+                logs.split("\n").slice(-100).map((line, index) => (
+                  <div className="log-line" key={`${index}-${line.slice(0, 20)}`}><span className="line-number">{String(index + 1).padStart(2, "0")}</span><span className={line.toLowerCase().includes("error") ? "log-error" : line.toLowerCase().includes("warn") ? "log-warn" : ""}>{line}</span></div>
+                ))
+              ) : (
+                <div className="terminal-empty"><span className="terminal-prompt">$</span> Waiting for output…<span className="cursor-block" /></div>
+              )}
+              <div ref={logsEndRef} />
+            </div>
+          </div>
+          <p className="logs-footnote"><Activity size={13} /> Logs are read from your local Docker containers. Updates every 5 seconds.</p>
+        </section>
+
+        <footer className="page-footer">
+          <span>Made for tinkering. Built to run where you do.</span>
+          <a href="https://github.com/Aiman003516/open-paas" target="_blank" rel="noreferrer">Open source on GitHub <ExternalLink size={13} /></a>
+        </footer>
       </div>
-      
-      {/* Global Scrollbar Styles */}
-      <style dangerouslySetInnerHTML={{__html: `
-        .custom-scrollbar::-webkit-scrollbar {
-          width: 8px;
-        }
-        .custom-scrollbar::-webkit-scrollbar-track {
-          background: rgba(0,0,0,0.2);
-        }
-        .custom-scrollbar::-webkit-scrollbar-thumb {
-          background: rgba(255,255,255,0.1);
-          border-radius: 10px;
-        }
-        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-          background: rgba(255,255,255,0.2);
-        }
-      `}} />
-    </div>
+    </main>
   );
 }

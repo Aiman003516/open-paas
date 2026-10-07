@@ -1,54 +1,29 @@
-# The Next-Generation Open-Source PaaS (Architecture & Master Plan)
+# Open-PaaS — direction and current shape
 
-## Vision
-To build the world's first **Zero-Config, Local-First, Zero-Trust PaaS**. A platform that allows developers to turn any local laptop, Raspberry Pi, or cheap VPS into a production-ready edge node. It bypasses NAT/Firewalls instantly using Cloudflare Tunnels, builds code autonomously using Nixpacks, and secures the host using kernel-level eBPF microsegmentation.
+## Product direction
 
----
+Open-PaaS is a personal, self-hosted place to experiment with deploying small projects. A developer runs it on their own machine, brings a public GitHub repository, and uses Docker to build and run the app. The product should stay approachable: a focused dashboard, clear status, and useful feedback without hosted-platform assumptions.
 
-## Phase 1: The Zero-Config Engine (✅ COMPLETED)
-**Goal:** Orchestrate Docker and bypass CGNAT without manual configuration.
-- [x] Go Engine HTTP Webhook Listener.
-- [x] Docker CLI integration for container orchestration.
-- [x] Native Cloudflare Tunnel (`trycloudflare.com`) integration.
-- [x] Dynamic URL extraction and routing.
+## Current implementation
 
-## Phase 2: GitOps & Autonomous Build (🚧 NEXT)
-**Goal:** Transform raw GitHub code into running applications automatically.
-- [ ] **Git Integration:** Auto-clone repositories from GitHub Webhooks.
-- [ ] **Nixpacks Engine:** Run Nixpacks inside a Docker container to automatically detect languages (Node, Python, Go) and build optimized Docker images without local dependencies.
-- [ ] **Ephemeral PR Previews:** Listen for Pull Request events, build the branch, generate a temporary Cloudflare URL, and post the link as a GitHub comment. Auto-destroy the container when the PR closes.
+- Go HTTP engine with health, deployment, container list, logs, restart, and SSE relay endpoints.
+- Next.js dashboard for submitting public GitHub repository URLs, seeing managed containers, and viewing recent app logs.
+- Bearer-token authentication on engine endpoints, with a same-origin dashboard proxy keeping the token server-side.
+- Nixpacks build through a locally built builder image.
+- Docker app containers with resource limits and persistent `/data` volumes.
+- Optional temporary LocalTunnel URL.
+- Isolated temporary clone directories for concurrent builds.
 
-## Phase 3: Zero-Trust Security & eBPF Microsegmentation
-**Goal:** Guarantee that running public apps on a home laptop is 100% secure.
-- [ ] **Docker Rootless Mode:** Enforce all deployments to run without root privileges.
-- [ ] **eBPF LSM (Linux Security Modules):** Implement kernel-level sandboxing. 
-- [ ] **LAN Egress Blocking:** Explicitly drop any outbound traffic from the containers attempting to reach private LAN IP ranges (e.g., `192.168.0.0/16` or `10.0.0.0/8`). Prevent lateral movement attacks natively.
+The app is an early personal-use project. It has no interactive user sign-in, private repository support, deployment database, durable build history, or dashboard build-log stream. The engine API token protects requests but is not a multi-user identity system. It should remain on a trusted local machine until safer build isolation is in place.
 
-## Phase 4: Agentic DevOps via MCP (AI Auto-Healing)
-**Goal:** Allow AI models to monitor and fix broken deployments in real-time.
-- [ ] **Embedded MCP Server:** Add a Model Context Protocol (MCP) server to the Go Engine.
-- [ ] **Observability API:** Expose container metrics, build states, and crash logs to the MCP interface.
-- [ ] **AI Auto-Healing:** Allow AI assistants (like Claude or Cursor) to query the PaaS, read the Docker logs of a crashing app, identify missing environment variables, and automatically propose or inject fixes.
+## Practical next steps
 
-## Phase 5: The Edge Data Network (Local-First Sync)
-**Goal:** Eradicate the need for central cloud databases (like AWS RDS).
-- [ ] **LiteFS & SQLite:** Default to distributed SQLite databases using LiteFS (FUSE-based replication).
-- [ ] **Active-Active CRDT Syncing:** Implement Conflict-Free Replicated Data Types (like ElectricSQL) so multiple local environments can write data simultaneously, resolving conflicts automatically when reconnected to the mesh.
+1. Add a deployment/job record with explicit queued, building, running, and failed states.
+2. Stream build progress and errors into the dashboard.
+3. Add a straightforward way to open a running app's public URL and restart or remove it.
+4. Document supported project types, app port expectations, and how persistent data is mounted.
+5. Before connecting from outside the local machine, design access controls and a build isolation model that does not expose the host Docker socket to untrusted build code.
 
-## Phase 6: WASI 0.2 MicroVMs & Confidential Computing
-**Goal:** Millisecond cold-starts and military-grade isolation.
-- [ ] **Firecracker MicroVMs:** Run untrusted code or AI-generated functions in Firecracker for <125ms cold starts.
-- [ ] **WASI 0.2 Component Model:** Support WebAssembly execution for edge functions with <1ms latency and strict linear memory isolation.
-- [ ] **Confidential Enclaves:** Support AMD SEV-SNP and Intel TDX to encrypt the container's RAM, ensuring not even the host machine owner can steal API keys or data from the running app.
+## Keep the scope clear
 
-## Phase 7: Stateful WebSocket Relays (Actor-Model)
-**Goal:** Solve the Cloudflare Tunnel timeout issue for real-time apps.
-- [ ] **Gateway Relay:** Build a persistent edge gateway that holds WebSocket connections open for clients.
-- [ ] **Actor-Model Coordination:** If the underlying Cloudflare Tunnel resets (due to the 100-second idle limit), the Gateway holds the client connection alive while the local PaaS instantly reconnects, resulting in zero state loss for real-time multiplayer apps.
-
-## Phase 8: The Vercel-like Dashboard
-**Goal:** The GUI for managing the decentralized mesh.
-- [ ] Build a Next.js or React frontend.
-- [ ] Connect GitHub OAuth.
-- [ ] Stream Nixpacks build logs via WebSockets to the UI.
-- [ ] Manage Environment Variables, Custom Domains, and scaling limits.
+Container execution, network exposure, and Docker-socket access are not a security boundary for hostile source code. Feature descriptions should reflect verified behavior rather than roadmap ideas.

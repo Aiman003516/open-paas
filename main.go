@@ -1,11 +1,16 @@
 package main
 
 import (
+	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,7 +20,12 @@ import (
 	"time"
 )
 
-type WebhookPayload struct {
+const (
+	maxRequestBytes = 64 * 1024
+	managedLabel    = "open-paas.managed"
+)
+
+type DeployPayload struct {
 	RepoURL   string `json:"repo_url"`
 	Subdomain string `json:"subdomain"`
 }
@@ -26,301 +36,478 @@ type Deployment struct {
 	Status string `json:"status"`
 }
 
-// Middleware to allow the Next.js Dashboard to call this API without CORS errors
-func enableCORS(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+type APIError struct {
+	Error string `json:"error"`
+}
 
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusOK)
+var (
+	githubOwnerPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,100}$`)
+	githubRepoPattern  = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,100}$`)
+	subdomainPattern   = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+	containerPattern   = regexp.MustCompile(`^open-paas-app-[a-z0-9-]{1,100}$`)
+	publicTunnelURL    = regexp.MustCompile(`https://[a-zA-Z0-9-]+\.loca\.lt`)
+)
+
+type messageBroker struct {
+	broadcast chan string
+	clients   map[chan string]struct{}
+	mu        sync.Mutex
+}
+
+func newMessageBroker() *messageBroker {
+	return &messageBroker{broadcast: make(chan string, 128), clients: make(map[chan string]struct{})}
+}
+
+func (b *messageBroker) run() {
+	for message := range b.broadcast {
+		b.mu.Lock()
+		for client := range b.clients {
+			// A slow subscriber must never stall other subscribers or publishers.
+			select {
+			case client <- message:
+			default:
+			}
+		}
+		b.mu.Unlock()
+	}
+}
+
+func (b *messageBroker) subscribe() chan string {
+	client := make(chan string, 16)
+	b.mu.Lock()
+	b.clients[client] = struct{}{}
+	b.mu.Unlock()
+	return client
+}
+
+func (b *messageBroker) unsubscribe(client chan string) {
+	b.mu.Lock()
+	delete(b.clients, client)
+	close(client)
+	b.mu.Unlock()
+}
+
+func (b *messageBroker) publish(message string) bool {
+	select {
+	case b.broadcast <- message:
+		return true
+	default:
+		return false
+	}
+}
+
+var broker = newMessageBroker()
+var deploymentLocks sync.Map
+
+func main() {
+	apiToken := strings.TrimSpace(os.Getenv("OPEN_PAAS_API_TOKEN"))
+	if len(apiToken) < 32 {
+		log.Fatal("OPEN_PAAS_API_TOKEN must be set to a secret of at least 32 characters")
+	}
+	secure := func(handler http.HandlerFunc) http.HandlerFunc {
+		return withCORS(requireAPIToken(handler))
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", secure(healthHandler))
+	mux.HandleFunc("/webhook", secure(deployHandler))
+	mux.HandleFunc("/deploy", secure(deployHandler))
+	mux.HandleFunc("/deployments", secure(deploymentsHandler))
+	mux.HandleFunc("/logs", secure(logsHandler))
+	mux.HandleFunc("/restart", secure(restartHandler))
+	mux.HandleFunc("/relay", secure(relayHandler))
+	mux.HandleFunc("/publish", secure(publishHandler))
+
+	go broker.run()
+	address := strings.TrimSpace(os.Getenv("LISTEN_ADDR"))
+	if address == "" {
+		address = ":8080"
+	}
+	server := &http.Server{Addr: address, Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
+	log.Printf("Open-PaaS engine listening on %s", address)
+	log.Fatal(server.ListenAndServe())
+}
+
+func allowedOrigins() map[string]struct{} {
+	configured := strings.TrimSpace(os.Getenv("CORS_ALLOWED_ORIGINS"))
+	if configured == "" {
+		configured = "http://localhost:3000,http://127.0.0.1:3000"
+	}
+	origins := make(map[string]struct{})
+	for _, value := range strings.Split(configured, ",") {
+		origin := strings.TrimSpace(value)
+		parsed, err := url.Parse(origin)
+		if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+			continue
+		}
+		origins[origin] = struct{}{}
+	}
+	return origins
+}
+
+func withCORS(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			if _, ok := allowedOrigins()[origin]; ok {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+				w.Header().Add("Vary", "Origin")
+			}
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		next(w, r)
 	}
 }
 
-var (
-	clients   = make(map[chan string]bool)
-	broadcast = make(chan string)
-	mutex     = &sync.Mutex{}
-)
-
-func main() {
-	// Start the relay broker
-	go handleMessages()
-
-	// Register API Routes
-	http.HandleFunc("/webhook", enableCORS(webhookHandler))
-	http.HandleFunc("/deploy", enableCORS(webhookHandler)) // Same as webhook for now
-	http.HandleFunc("/deployments", enableCORS(getDeploymentsHandler))
-	http.HandleFunc("/logs", enableCORS(getLogsHandler))
-	http.HandleFunc("/restart", enableCORS(restartHandler))
-	
-	// Phase 7: Stateful Relay
-	http.HandleFunc("/relay", enableCORS(relayHandler))
-	http.HandleFunc("/publish", enableCORS(publishHandler))
-
-	fmt.Println("🚀 Open-PaaS Engine started on port 8080")
-	fmt.Println("API Endpoints Ready:")
-	fmt.Println(" - POST /webhook (GitHub triggers)")
-	fmt.Println(" - POST /deploy  (Dashboard manual deploy)")
-	fmt.Println(" - GET  /deployments (List running apps)")
-	fmt.Println(" - GET  /logs?container=my-app (Stream logs)")
-	fmt.Println(" - POST /restart?container=my-app (Restart container)")
-	fmt.Println(" - GET  /relay   (Subscribe to events)")
-	fmt.Println(" - POST /publish (Send event)")
-	
-	log.Fatal(http.ListenAndServe(":8080", nil))
-}
-
-// Endpoint: POST /restart
-func restartHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	containerName := r.URL.Query().Get("container")
-	if containerName == "" {
-		http.Error(w, "Missing container query param", http.StatusBadRequest)
-		return
-	}
-	err := exec.Command("docker", "restart", containerName).Run()
-	if err != nil {
-		http.Error(w, "Failed to restart container", http.StatusInternalServerError)
-		return
-	}
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Container restarted successfully"))
-}
-
-// Endpoint: GET /deployments
-func getDeploymentsHandler(w http.ResponseWriter, r *http.Request) {
-	// Read running Docker containers to show them on the Dashboard
-	out, err := exec.Command("docker", "ps", "--format", "{{.ID}}|{{.Names}}|{{.Status}}").Output()
-	if err != nil {
-		http.Error(w, "Failed to get deployments", http.StatusInternalServerError)
-		return
-	}
-
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	var deployments []Deployment
-
-	for _, line := range lines {
-		if line == "" {
-			continue
+func requireAPIToken(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		expected := strings.TrimSpace(os.Getenv("OPEN_PAAS_API_TOKEN"))
+		if expected == "" {
+			writeJSON(w, http.StatusServiceUnavailable, APIError{Error: "engine API token is not configured"})
+			return
 		}
-		parts := strings.Split(line, "|")
-		if len(parts) >= 3 {
-			deployments = append(deployments, Deployment{
-				ID:     parts[0],
-				Name:   parts[1],
-				Status: parts[2],
-			})
+		scheme, provided, ok := strings.Cut(r.Header.Get("Authorization"), " ")
+		if !ok || !strings.EqualFold(scheme, "Bearer") || subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="open-paas"`)
+			writeJSON(w, http.StatusUnauthorized, APIError{Error: "valid bearer token required"})
+			return
 		}
+		next(w, r)
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(deployments)
 }
 
-// Endpoint: GET /logs
-func getLogsHandler(w http.ResponseWriter, r *http.Request) {
-	containerName := r.URL.Query().Get("container")
-	if containerName == "" {
-		containerName = "my-app" // default to the main app if not specified
+func methodOnly(w http.ResponseWriter, r *http.Request, method string) bool {
+	if r.Method == method {
+		return true
 	}
+	w.Header().Set("Allow", method+", OPTIONS")
+	writeJSON(w, http.StatusMethodNotAllowed, APIError{Error: "method not allowed"})
+	return false
+}
 
-	// Fetch the last 100 lines of logs from the Docker container
-	out, err := exec.Command("docker", "logs", "--tail", "100", containerName).CombinedOutput()
-	if err != nil {
-		w.Header().Set("Content-Type", "text/plain")
-		w.Write([]byte("Container not found or starting up..."))
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(value); err != nil {
+		log.Printf("write response: %v", err)
+	}
+}
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	if !methodOnly(w, r, http.MethodGet) {
 		return
 	}
-
-	w.Header().Set("Content-Type", "text/plain")
-	w.Write(out)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// Endpoint: POST /webhook or /deploy
-func webhookHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Only POST requests are allowed", http.StatusMethodNotAllowed)
-		return
+func decodeDeployPayload(w http.ResponseWriter, r *http.Request) (DeployPayload, error) {
+	var payload DeployPayload
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBytes))
+	if err := decoder.Decode(&payload); err != nil {
+		return payload, fmt.Errorf("request body must be valid JSON: %w", err)
 	}
-
-	repoURL := "https://github.com/heroku/node-js-getting-started"
-	subdomain := ""
-	var payload WebhookPayload
-	if err := json.NewDecoder(r.Body).Decode(&payload); err == nil {
-		if payload.RepoURL != "" {
-			repoURL = payload.RepoURL
-		}
-		if payload.Subdomain != "" {
-			subdomain = payload.Subdomain
-		}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return payload, fmt.Errorf("request body must contain a single JSON object")
 	}
-
-	fmt.Printf("\n🔔 Deployment triggered for: %s (Subdomain: %s)\n", repoURL, subdomain)
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"status": "Deploying", "repo": "` + repoURL + `"}`))
-
-	go runPipeline(repoURL, subdomain)
+	return payload, nil
 }
 
-func runPipeline(repoURL, subdomain string) {
-	// Generate unique names based on the subdomain
-	containerName := "app"
+func validateGitHubRepo(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	parsed, err := url.ParseRequestURI(raw)
+	if err != nil || parsed.Scheme != "https" || !strings.EqualFold(parsed.Hostname(), "github.com") || parsed.Port() != "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.RawPath != "" {
+		return "", fmt.Errorf("repository must be an HTTPS URL on github.com")
+	}
+	path := strings.Trim(parsed.Path, "/")
+	if strings.HasSuffix(strings.ToLower(path), ".git") {
+		path = path[:len(path)-4]
+	}
+	parts := strings.Split(path, "/")
+	if len(parts) != 2 || !githubOwnerPattern.MatchString(parts[0]) || !githubRepoPattern.MatchString(parts[1]) || parts[0] == "." || parts[0] == ".." || parts[1] == "." || parts[1] == ".." {
+		return "", fmt.Errorf("repository URL must look like https://github.com/owner/repository")
+	}
+	return "https://github.com/" + parts[0] + "/" + parts[1] + ".git", nil
+}
+
+func validateSubdomain(value string) (string, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return "", nil
+	}
+	if !subdomainPattern.MatchString(value) {
+		return "", fmt.Errorf("subdomain must use 1–63 lowercase letters, numbers, or hyphens, and cannot start or end with a hyphen")
+	}
+	return value, nil
+}
+
+func deploymentName(repoURL, subdomain string) string {
+	parsed, _ := url.Parse(repoURL)
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	slug := "app"
 	if subdomain != "" {
-		containerName = "app-" + subdomain
+		slug = subdomain
+	} else if len(parts) == 2 {
+		slug = strings.TrimSuffix(parts[1], ".git")
 	}
+	slug = strings.ToLower(strings.Trim(slug, "-_."))
+	slug = strings.ReplaceAll(slug, "_", "-")
+	if len(slug) > 48 {
+		slug = slug[:48]
+	}
+	if slug == "" {
+		slug = "app"
+	}
+	digest := sha256.Sum256([]byte(repoURL + "\n" + subdomain))
+	return "open-paas-app-" + slug + "-" + hex.EncodeToString(digest[:3])
+}
+
+func deployHandler(w http.ResponseWriter, r *http.Request) {
+	if !methodOnly(w, r, http.MethodPost) {
+		return
+	}
+	payload, err := decodeDeployPayload(w, r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, APIError{Error: err.Error()})
+		return
+	}
+	repoURL, err := validateGitHubRepo(payload.RepoURL)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, APIError{Error: err.Error()})
+		return
+	}
+	subdomain, err := validateSubdomain(payload.Subdomain)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, APIError{Error: err.Error()})
+		return
+	}
+	name := deploymentName(repoURL, subdomain)
+	log.Printf("deployment requested: repo=%s container=%s", repoURL, name)
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted", "repository": repoURL, "container": name})
+	go func() {
+		if err := runPipeline(repoURL, subdomain, name); err != nil {
+			log.Printf("deployment %s failed: %v", name, err)
+		}
+	}()
+}
+
+func dockerCommand(ctx context.Context, args ...string) *exec.Cmd {
+	return exec.CommandContext(ctx, "docker", args...)
+}
+
+func runPipeline(repoURL, subdomain, containerName string) error {
+	lockValue, _ := deploymentLocks.LoadOrStore(containerName, &sync.Mutex{})
+	deploymentLock := lockValue.(*sync.Mutex)
+	deploymentLock.Lock()
+	defer deploymentLock.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+	buildRoot, err := os.MkdirTemp("", "open-paas-build-")
+	if err != nil {
+		return fmt.Errorf("create isolated build directory: %w", err)
+	}
+	defer os.RemoveAll(buildRoot)
+	repoPath := filepath.Join(buildRoot, "source")
+
+	log.Printf("%s: cloning repository", containerName)
+	clone := exec.CommandContext(ctx, "git", "clone", "--depth", "1", "--", repoURL, repoPath)
+	clone.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	if output, err := clone.CombinedOutput(); err != nil {
+		return fmt.Errorf("clone repository: %w: %s", err, conciseOutput(output))
+	}
+
+	tunnelName := strings.Replace(containerName, "open-paas-app-", "open-paas-tunnel-", 1)
 	imageName := containerName + "-image"
-	tunnelName := containerName + "-tunnel"
 
-	fmt.Println("🧹 Step 1: Cleaning up old deployments...")
-	exec.Command("docker", "rm", "-f", containerName, tunnelName).Run()
-	os.RemoveAll(".tmp-build")
-
-	fmt.Println("📥 Step 2: Cloning repository...")
-	err := exec.Command("git", "clone", repoURL, ".tmp-build").Run()
-	if err != nil {
-		fmt.Printf("❌ Failed to clone repo: %v\n", err)
-		return
-	}
-
-	pwd, _ := os.Getwd()
-	repoPath := filepath.Join(pwd, ".tmp-build")
-
-	// Phase 6: WASI 0.2 MicroVMs & Confidential Computing
-	wasmPath := filepath.Join(repoPath, "main.wasm")
-	if _, err := os.Stat(wasmPath); err == nil {
-		fmt.Println("⚡ WebAssembly (WASI) MicroVM detected! Bypassing Docker...")
-		fmt.Println("🚀 Spinning up Wasmtime runtime in <10ms...")
-		
-		runWasm := exec.Command("wasmtime", "serve", "main.wasm", "--addr", "0.0.0.0:3000")
-		runWasm.Dir = repoPath
-		runWasm.Start() // Run in background
-
-		fmt.Println("☁️  Step 5: Provisioning Tunnel for MicroVM...")
-		tunnelArgs := []string{"run", "-d", "--name", tunnelName, "--network", "host", "node:18-alpine", "npx", "localtunnel", "--port", "3000"}
-		if subdomain != "" {
-			tunnelArgs = append(tunnelArgs, "--subdomain", subdomain)
-		}
-		exec.Command("docker", tunnelArgs...).Run()
-		
-		time.Sleep(3 * time.Second)
-		logs, _ := exec.Command("docker", "logs", tunnelName).CombinedOutput()
-		re := regexp.MustCompile(`https://[a-zA-Z0-9-]+\.loca\.lt`)
-		match := re.FindString(string(logs))
-		if match != "" {
-			fmt.Printf("\n✅ MICRO-VM SUCCESS! LIVE at: 🌐 %s\n\n", match)
-		}
-		return // Skip docker build
-	}
-
-	fmt.Println("⚙️  Step 3: Running Nixpacks Builder...")
-	
-	buildCmd := exec.Command("docker", "run", "--rm", 
+	log.Printf("%s: building application image", containerName)
+	build := dockerCommand(ctx,
+		"run", "--rm",
 		"-e", "DOCKER_BUILDKIT=0",
-		"-v", "/var/run/docker.sock:/var/run/docker.sock", 
-		"-v", repoPath+":/app", 
-		"open-paas-builder", "build", "/app", "--name", imageName)
-	
-	buildCmd.Stdout = os.Stdout
-	buildCmd.Stderr = os.Stderr
-	err = buildCmd.Run()
-	if err != nil {
-		fmt.Printf("❌ Nixpacks build failed: %v\n", err)
-		return
+		"-v", "/var/run/docker.sock:/var/run/docker.sock",
+		"-v", repoPath+":/app:ro",
+		"open-paas-builder", "build", "/app", "--name", imageName,
+	)
+	build.Stdout = os.Stdout
+	build.Stderr = os.Stderr
+	if err := build.Run(); err != nil {
+		return fmt.Errorf("build failed: %w", err)
 	}
+	log.Printf("%s: replacing existing app container", containerName)
+	_ = dockerCommand(ctx, "rm", "-f", containerName, tunnelName).Run()
 
-	fmt.Println("📦 Step 4: Provisioning Edge Database & Spinning up application...")
 	volumeName := containerName + "-data"
-	exec.Command("docker", "volume", "create", volumeName).Run()
-
-	err = exec.Command("docker", "run", "-d", 
-		"--cpus", "0.5", 
-		"--memory", "512m", 
-		"--pids-limit", "100", 
-		"--security-opt", "no-new-privileges:true", 
-		"-v", volumeName+":/data", 
-		"-e", "PORT=3000", 
-		"-e", "DATABASE_URL=sqlite:///data/sqlite.db", 
-		"--name", containerName, imageName).Run()
-	if err != nil {
-		fmt.Printf("❌ Failed to start app container: %v\n", err)
-		return
+	if output, err := dockerCommand(ctx, "volume", "create", volumeName).CombinedOutput(); err != nil {
+		return fmt.Errorf("create data volume: %w: %s", err, conciseOutput(output))
+	}
+	log.Printf("%s: starting app container", containerName)
+	appArgs := []string{
+		"run", "-d",
+		"--restart", "unless-stopped",
+		"--label", managedLabel + "=true",
+		"--label", "open-paas.repository=" + repoURL,
+		"--cpus", "0.5",
+		"--memory", "512m",
+		"--pids-limit", "100",
+		"--security-opt", "no-new-privileges:true",
+		"-v", volumeName + ":/data",
+		"-e", "PORT=3000",
+		"-e", "DATABASE_URL=sqlite:///data/sqlite.db",
+		"--name", containerName,
+		imageName,
+	}
+	if output, err := dockerCommand(ctx, appArgs...).CombinedOutput(); err != nil {
+		return fmt.Errorf("start app container: %w: %s", err, conciseOutput(output))
 	}
 
-	fmt.Println("☁️  Step 5: Provisioning Tunnel...")
-	tunnelArgs := []string{"run", "-d", "--name", tunnelName, "--link", containerName, "node:18-alpine", "npx", "localtunnel", "--port", "3000", "--local-host", containerName}
+	log.Printf("%s: starting localtunnel", containerName)
+	tunnelArgs := []string{
+		"run", "-d", "--label", managedLabel + "=tunnel",
+		"--link", containerName,
+		"--name", tunnelName,
+		"node:18-alpine", "npx", "localtunnel", "--port", "3000", "--local-host", containerName,
+	}
 	if subdomain != "" {
 		tunnelArgs = append(tunnelArgs, "--subdomain", subdomain)
 	}
-
-	err = exec.Command("docker", tunnelArgs...).Run()
-	if err != nil {
-		fmt.Printf("❌ Failed to start tunnel: %v\n", err)
-		return
+	if output, err := dockerCommand(ctx, tunnelArgs...).CombinedOutput(); err != nil {
+		return fmt.Errorf("start tunnel: %w: %s", err, conciseOutput(output))
 	}
-
-	fmt.Println("⏳ Waiting for Tunnel...")
-	time.Sleep(6 * time.Second)
-
-	logs, _ := exec.Command("docker", "logs", tunnelName).CombinedOutput()
-	re := regexp.MustCompile(`https://[a-zA-Z0-9-]+\.loca\.lt`)
-	match := re.FindString(string(logs))
-
-	if match != "" {
-		fmt.Printf("\n✅ SUCCESS! LIVE at: 🌐 %s\n\n", match)
-	} else {
-		fmt.Println("⚠️  Could not parse Tunnel URL yet. Check logs.")
+	for attempt := 0; attempt < 12; attempt++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		time.Sleep(2 * time.Second)
+		logs, _ := dockerCommand(ctx, "logs", tunnelName).CombinedOutput()
+		if liveURL := publicTunnelURL.FindString(string(logs)); liveURL != "" {
+			log.Printf("%s is available at %s", containerName, liveURL)
+			return nil
+		}
 	}
+	return fmt.Errorf("tunnel started but no loca.lt URL appeared in its logs")
 }
 
-// --- Phase 7: Stateful SSE Relay Handlers ---
-func handleMessages() {
-	for {
-		msg := <-broadcast
-		mutex.Lock()
-		for client := range clients {
-			client <- msg
-		}
-		mutex.Unlock()
+func conciseOutput(output []byte) string {
+	text := strings.TrimSpace(string(output))
+	if len(text) > 1000 {
+		text = text[len(text)-1000:]
 	}
+	return text
+}
+
+func deploymentsHandler(w http.ResponseWriter, r *http.Request) {
+	if !methodOnly(w, r, http.MethodGet) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	output, err := dockerCommand(ctx, "ps", "--all", "--filter", "label="+managedLabel+"=true", "--format", "{{.ID}}|{{.Names}}|{{.Status}}").Output()
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, APIError{Error: "Docker is unavailable or could not list managed containers"})
+		return
+	}
+	deployments := make([]Deployment, 0)
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		parts := strings.SplitN(line, "|", 3)
+		if len(parts) == 3 && parts[0] != "" && parts[1] != "" {
+			deployments = append(deployments, Deployment{ID: parts[0], Name: parts[1], Status: parts[2]})
+		}
+	}
+	writeJSON(w, http.StatusOK, deployments)
+}
+
+func ensureManagedContainer(ctx context.Context, name string) error {
+	if !containerPattern.MatchString(name) {
+		return fmt.Errorf("container name is not managed by Open-PaaS")
+	}
+	format := `{{ index .Config.Labels "open-paas.managed" }}`
+	output, err := dockerCommand(ctx, "inspect", "--format", format, name).Output()
+	if err != nil || strings.TrimSpace(string(output)) != "true" {
+		return fmt.Errorf("container is not a managed Open-PaaS app")
+	}
+	return nil
+}
+
+func logsHandler(w http.ResponseWriter, r *http.Request) {
+	if !methodOnly(w, r, http.MethodGet) {
+		return
+	}
+	containerName := r.URL.Query().Get("container")
+	if containerName == "" {
+		writeJSON(w, http.StatusBadRequest, APIError{Error: "container query parameter is required"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	if err := ensureManagedContainer(ctx, containerName); err != nil {
+		writeJSON(w, http.StatusNotFound, APIError{Error: err.Error()})
+		return
+	}
+	output, err := dockerCommand(ctx, "logs", "--tail", "100", containerName).CombinedOutput()
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, APIError{Error: "could not read logs for this app"})
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write(output)
+}
+
+func restartHandler(w http.ResponseWriter, r *http.Request) {
+	if !methodOnly(w, r, http.MethodPost) {
+		return
+	}
+	containerName := r.URL.Query().Get("container")
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	if err := ensureManagedContainer(ctx, containerName); err != nil {
+		writeJSON(w, http.StatusNotFound, APIError{Error: err.Error()})
+		return
+	}
+	if output, err := dockerCommand(ctx, "restart", containerName).CombinedOutput(); err != nil {
+		log.Printf("restart %s: %v: %s", containerName, err, conciseOutput(output))
+		writeJSON(w, http.StatusServiceUnavailable, APIError{Error: "could not restart this app"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "restarted", "container": containerName})
 }
 
 func relayHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-
-	messageChan := make(chan string)
-	mutex.Lock()
-	clients[messageChan] = true
-	mutex.Unlock()
-
-	defer func() {
-		mutex.Lock()
-		delete(clients, messageChan)
-		mutex.Unlock()
-		close(messageChan)
-	}()
-
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+	if !methodOnly(w, r, http.MethodGet) {
 		return
 	}
-
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeJSON(w, http.StatusInternalServerError, APIError{Error: "streaming is not supported by this server"})
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("X-Accel-Buffering", "no")
+	client := broker.subscribe()
+	defer broker.unsubscribe(client)
+	ticker := time.NewTicker(20 * time.Second)
+	defer ticker.Stop()
+	flusher.Flush()
 	for {
 		select {
-		case msg := <-messageChan:
-			fmt.Fprintf(w, "data: %s\n\n", msg)
+		case message := <-client:
+			for _, line := range strings.Split(message, "\n") {
+				if _, err := fmt.Fprintf(w, "data: %s\n", line); err != nil {
+					return
+				}
+			}
+			if _, err := fmt.Fprint(w, "\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		case <-ticker.C:
+			if _, err := fmt.Fprint(w, ": keep-alive\n\n"); err != nil {
+				return
+			}
 			flusher.Flush()
 		case <-r.Context().Done():
 			return
@@ -329,12 +516,21 @@ func relayHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func publishHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	if !methodOnly(w, r, http.MethodPost) {
 		return
 	}
-	body, _ := io.ReadAll(r.Body)
-	broadcast <- string(body)
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Published"))
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBytes))
+	if err != nil {
+		writeJSON(w, http.StatusRequestEntityTooLarge, APIError{Error: "message exceeds the request size limit"})
+		return
+	}
+	if !json.Valid(body) {
+		writeJSON(w, http.StatusBadRequest, APIError{Error: "message must be valid JSON"})
+		return
+	}
+	if !broker.publish(string(body)) {
+		writeJSON(w, http.StatusServiceUnavailable, APIError{Error: "relay is busy; try again shortly"})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "published"})
 }

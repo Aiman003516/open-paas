@@ -1,31 +1,49 @@
-version: '3.8'
-
 services:
-  # The Backend Engine (Go)
+  builder-image:
+    image: open-paas-builder
+    build:
+      context: .
+      dockerfile: Dockerfile.builder
+    entrypoint: ["nixpacks"]
+    command: ["--help"]
+    restart: "no"
+
   engine:
-    build: 
+    build:
       context: .
       dockerfile: Dockerfile
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      LISTEN_ADDR: ":8080"
+      CORS_ALLOWED_ORIGINS: "http://localhost:3000,http://127.0.0.1:3000"
+      OPEN_PAAS_API_TOKEN: ${OPEN_PAAS_API_TOKEN:?Set OPEN_PAAS_API_TOKEN in .env}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    ports:
-      - "8080:8080"
-    environment:
-      - PORT=8080
+    depends_on:
+      builder-image:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -H 'Authorization: Bearer $$OPEN_PAAS_API_TOKEN' http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
     networks:
       - paas-network
 
-  # The Frontend Dashboard (Next.js)
   dashboard:
     build:
       context: ./dashboard
       dockerfile: Dockerfile
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
-      - NEXT_PUBLIC_ENGINE_URL=http://localhost:8080
+      OPEN_PAAS_ENGINE_URL: "http://engine:8080"
+      OPEN_PAAS_API_TOKEN: ${OPEN_PAAS_API_TOKEN:?Set OPEN_PAAS_API_TOKEN in .env}
+      DASHBOARD_ALLOWED_ORIGINS: "http://localhost:3000,http://127.0.0.1:3000"
     depends_on:
-      - engine
+      engine:
+        condition: service_healthy
     networks:
       - paas-network
 

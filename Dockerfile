@@ -1,13 +1,7 @@
-FROM golang:1.21-alpine
-
-RUN apk add --no-cache docker-cli git curl bash
-# Install Wasmtime
-RUN touch ~/.bashrc && curl https://wasmtime.dev/install.sh -sSf | bash
-ENV PATH="/root/.wasmtime/bin:$PATH"
-
+FROM golang:1.27-alpine
+RUN apk add --no-cache docker-cli git curl
 WORKDIR /app
-COPY main.go .
-RUN go build -o paas-engine main.go
-
+COPY go.mod main.go ./
+RUN go build -o paas-engine .
 EXPOSE 8080
 CMD ["./paas-engine"]
