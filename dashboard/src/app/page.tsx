@@ -18,6 +18,7 @@ import {
   TerminalSquare,
   Wifi,
   WifiOff,
+  X,
 } from "lucide-react";
 
 type Deployment = {
@@ -27,6 +28,7 @@ type Deployment = {
 };
 
 type EngineState = "checking" | "connected" | "offline";
+type ToastMessage = { id: number; kind: "success" | "error"; text: string };
 
 const ENGINE_URL = "/api/engine";
 const REPOSITORY_PATTERN = /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\.git)?\/?$/i;
@@ -34,6 +36,18 @@ const SUBDOMAIN_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
 function statusIsRunning(status: string) {
   return /^Up\b/i.test(status);
+}
+
+async function apiErrorMessage(response: Response) {
+  const text = await response.text();
+  if (!text) return `Request failed (HTTP ${response.status}).`;
+  try {
+    const payload = JSON.parse(text) as { error?: string };
+    if (payload.error) return payload.error;
+  } catch {
+    // Use the response text below when the API did not return JSON.
+  }
+  return text.slice(0, 240);
 }
 
 export default function Dashboard() {
@@ -45,9 +59,23 @@ export default function Dashboard() {
   const [isDeploying, setIsDeploying] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [notice, setNotice] = useState<{ kind: "success" | "error"; text: string } | null>(null);
+  const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [selectedContainer, setSelectedContainer] = useState("");
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
   const logsEndRef = useRef<HTMLDivElement>(null);
+  const toastSequence = useRef(0);
+  const engineErrorShown = useRef(false);
+  const logsErrorContainer = useRef("");
+
+  const showToast = useCallback((kind: ToastMessage["kind"], text: string) => {
+    const id = ++toastSequence.current;
+    setToasts((current) => [...current.slice(-2), { id, kind, text }]);
+    window.setTimeout(() => setToasts((current) => current.filter((toast) => toast.id !== id)), 6000);
+  }, []);
+
+  const dismissToast = useCallback((id: number) => {
+    setToasts((current) => current.filter((toast) => toast.id !== id));
+  }, []);
 
   const runningCount = useMemo(
     () => deployments.filter((deployment) => statusIsRunning(deployment.status)).length,
@@ -65,17 +93,23 @@ export default function Dashboard() {
         fetch(`${ENGINE_URL}/health`, { cache: "no-store" }),
         fetch(`${ENGINE_URL}/deployments`, { cache: "no-store" }),
       ]);
-      if (!healthResponse.ok || !deploymentsResponse.ok) throw new Error("The engine returned an error.");
+      if (!healthResponse.ok) throw new Error(await apiErrorMessage(healthResponse));
+      if (!deploymentsResponse.ok) throw new Error(await apiErrorMessage(deploymentsResponse));
       const nextDeployments = (await deploymentsResponse.json()) as Deployment[];
       setDeployments(Array.isArray(nextDeployments) ? nextDeployments : []);
       setEngineState("connected");
+      engineErrorShown.current = false;
       setUpdatedAt(new Date());
-    } catch {
+    } catch (error) {
       setEngineState("offline");
+      if (!engineErrorShown.current) {
+        engineErrorShown.current = true;
+        showToast("error", error instanceof Error ? error.message : "Could not reach the Open-PaaS engine.");
+      }
     } finally {
       if (showSpinner) setIsRefreshing(false);
     }
-  }, []);
+  }, [showToast]);
 
   useEffect(() => {
     const initialLoad = window.setTimeout(() => void refresh(), 0);
@@ -97,10 +131,28 @@ export default function Dashboard() {
           `${ENGINE_URL}/logs?container=${encodeURIComponent(chosenContainer)}`,
           { cache: "no-store" },
         );
+        if (!response.ok) {
+          const message = await apiErrorMessage(response);
+          if (!cancelled) {
+            setLogs(message);
+            if (logsErrorContainer.current !== chosenContainer) {
+              logsErrorContainer.current = chosenContainer;
+              showToast("error", `Could not load ${chosenContainer} logs: ${message}`);
+            }
+          }
+          return;
+        }
         const text = await response.text();
-        if (!cancelled) setLogs(response.ok ? text : text || "Unable to load logs.");
-      } catch {
-        if (!cancelled) setLogs("Could not reach the engine to load logs.");
+        logsErrorContainer.current = "";
+        if (!cancelled) setLogs(text);
+      } catch (error) {
+        if (!cancelled) {
+          setLogs("Could not reach the engine to load logs.");
+          if (logsErrorContainer.current !== chosenContainer) {
+            logsErrorContainer.current = chosenContainer;
+            showToast("error", error instanceof Error ? error.message : "Could not reach the engine to load logs.");
+          }
+        }
       }
     };
     void loadLogs();
@@ -109,7 +161,7 @@ export default function Dashboard() {
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, [chosenContainer]);
+  }, [chosenContainer, showToast]);
 
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ block: "nearest" });
@@ -137,6 +189,7 @@ export default function Dashboard() {
       const body = (await response.json().catch(() => ({}))) as { error?: string; status?: string };
       if (!response.ok) throw new Error(body.error || "The deployment request was rejected.");
       setNotice({ kind: "success", text: "Deploy request received. Your app will appear here when its container starts." });
+      showToast("success", "Deployment request accepted.");
       setRepoUrl("");
       await refresh();
     } catch (error) {
@@ -144,6 +197,7 @@ export default function Dashboard() {
         kind: "error",
         text: error instanceof Error ? error.message : "Could not send the deployment request.",
       });
+      showToast("error", error instanceof Error ? error.message : "Could not send the deployment request.");
     } finally {
       setIsDeploying(false);
     }
@@ -171,6 +225,18 @@ export default function Dashboard() {
           </div>
         </div>
       </header>
+
+      <div className="toast-region" aria-label="Notifications" aria-live="polite" aria-relevant="additions">
+        {toasts.map((toast) => (
+          <div className={`toast ${toast.kind}`} key={toast.id} role={toast.kind === "error" ? "alert" : "status"}>
+            <span className="toast-icon">{toast.kind === "error" ? <CircleAlert size={18} /> : <Check size={18} />}</span>
+            <p>{toast.text}</p>
+            <button type="button" className="toast-dismiss" onClick={() => dismissToast(toast.id)} aria-label="Dismiss notification">
+              <X size={16} />
+            </button>
+          </div>
+        ))}
+      </div>
 
       <div className="page-wrap" id="home">
         <section className="welcome-row">

@@ -89,8 +89,10 @@ func TestDeployHandlerRejectsInvalidInput(t *testing.T) {
 }
 
 func TestMethodAndCORSHandling(t *testing.T) {
-	handler := withCORS(healthHandler)
+	t.Setenv("OPEN_PAAS_API_TOKEN", "cors-integration-token")
+	handler := withCORS(requireAPIToken(healthHandler))
 	request := httptest.NewRequest(http.MethodPost, "/health", nil)
+	request.Header.Set("Authorization", "Bearer cors-integration-token")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusMethodNotAllowed {
@@ -101,11 +103,22 @@ func TestMethodAndCORSHandling(t *testing.T) {
 	request.Header.Set("Origin", "http://localhost:3000")
 	response = httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("allowed-origin request without token status = %d, want 401", response.Code)
+	}
 	if got := response.Header().Get("Access-Control-Allow-Origin"); got != "http://localhost:3000" {
 		t.Fatalf("allowed origin header = %q", got)
 	}
 	if got := response.Header().Get("Access-Control-Allow-Headers"); !strings.Contains(strings.ToLower(got), "authorization") {
 		t.Fatalf("CORS must allow the authenticated Authorization header, got %q", got)
+	}
+	request = httptest.NewRequest(http.MethodGet, "/health", nil)
+	request.Header.Set("Origin", "http://localhost:3000")
+	request.Header.Set("Authorization", "Bearer cors-integration-token")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("allowed-origin authenticated request status = %d, want 200", response.Code)
 	}
 	request = httptest.NewRequest(http.MethodOptions, "/health", nil)
 	request.Header.Set("Origin", "http://localhost:3000")
@@ -117,8 +130,12 @@ func TestMethodAndCORSHandling(t *testing.T) {
 
 	request = httptest.NewRequest(http.MethodGet, "/health", nil)
 	request.Header.Set("Origin", "https://unexpected.example")
+	request.Header.Set("Authorization", "Bearer cors-integration-token")
 	response = httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("authenticated disallowed-origin request status = %d, want 200", response.Code)
+	}
 	if got := response.Header().Get("Access-Control-Allow-Origin"); got != "" {
 		t.Fatalf("unexpected origin must not be allowed, got %q", got)
 	}

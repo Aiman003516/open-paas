@@ -69,3 +69,22 @@ Deployment requests return `202 Accepted` after validation. Builds run asynchron
 - Dashboard: Next.js, React, Tailwind CSS
 - Builder: Nixpacks
 - Temporary public URLs: LocalTunnel
+
+## Automated checks
+
+Run the Go API and authenticated-CORS checks from the repository root:
+
+```bash
+go test -race ./...
+go vet .
+```
+
+Run the dashboard checks from `dashboard/`:
+
+```bash
+npm run lint
+npm run build
+npm run test:integration
+```
+
+The proxy integration tests use Node's built-in test runner and a local test engine; they do not require Docker.
